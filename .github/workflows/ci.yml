@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      # Not `uv pip install --system`: the runner's system Python is externally
+      # managed (PEP 668) and refuses the install.
+      - name: Environment
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - run: uv pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src/ tests/ examples/
+      - name: Format
+        run: ruff format --check src/ tests/ examples/
+      - name: Type check
+        run: mypy src/custody
+      - name: Tests
+        run: pytest tests/ -q
+
+      # The README tells a reader to run this. It has to work from a clean
+      # install, not only from a working tree with src/ on the path.
+      - name: The quickstart the README promises
+        run: python examples/quickstart.py
