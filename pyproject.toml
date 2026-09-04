@@ -64,9 +64,7 @@ select = ["E", "F", "I", "UP"]
 known-first-party = ["custody"]
 
 [tool.mypy]
-# No python_version pin: mypy then checks against the interpreter it runs on.
-# Pinning it to 3.10 made the 3.12 CI leg fail inside numpy's own stubs, which
-# use `type` statements that 3.10 does not have.
+python_version = "3.10"
 strict = false
 warn_return_any = true
 warn_unused_configs = true
