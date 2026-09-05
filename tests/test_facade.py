@@ -136,3 +136,25 @@ class TestReceiver:
 
         assert delivery.rejected["Centre_2"]
         assert "Centre_2" not in delivery.accepted
+
+
+class TestBudgetCeiling:
+    """The cap is the centre's ceiling, and it cannot move underfoot."""
+
+    def test_a_changed_cap_is_refused_rather_than_ignored(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1")
+        centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
+        with pytest.raises(ValueError, match="cannot be re-ceilinged"):
+            centre.release(200, seed=6, privacy=Privacy(epsilon=1.0, cap=0.001))
+
+    def test_the_same_cap_keeps_releasing(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1")
+        first = centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
+        second = centre.release(200, seed=6, privacy=Privacy(epsilon=1.0, cap=5.0))
+        assert second.epsilon > first.epsilon
+
+    def test_a_fresh_centre_enforces_a_tight_cap_from_the_first_release(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1")
+        with pytest.raises(BudgetExhausted):
+            centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=0.001))
+        assert centre.spent == 0.0

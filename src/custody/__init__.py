@@ -251,10 +251,23 @@ class Centre:
         """
         if privacy is not None:
             self._node.dp = privacy._config()
-            if self._node.budget is None or privacy.cap is not None:
-                self._node.budget = self._node.budget or FamilyBudget(
-                    cap_epsilon=(privacy.cap if privacy.cap is not None else privacy.epsilon),
+            requested_cap = privacy.cap if privacy.cap is not None else privacy.epsilon
+            if self._node.budget is None:
+                self._node.budget = FamilyBudget(
+                    cap_epsilon=requested_cap,
                     delta=privacy._config().resolved_delta(self.n_families),
+                )
+            elif requested_cap != self._node.budget.cap_epsilon:
+                # The cap is the centre's cumulative ceiling, fixed when it first
+                # released. Honouring a new one would rewrite the budget the
+                # earlier certificates were issued against; ignoring it silently
+                # would let a caller tighten the cap, watch the release succeed,
+                # and report a ceiling that was never enforced.
+                raise ValueError(
+                    f"this centre is already releasing against a cap of "
+                    f"{self._node.budget.cap_epsilon}, and {requested_cap} was asked "
+                    f"for. A cumulative budget cannot be re-ceilinged part way "
+                    f"through; build a new Centre to release under a different cap."
                 )
         payload = self._node.emit(n_patients=n_patients, seed=seed)
         spent = None if self._node.budget is None else float(self._node.budget.spent)
