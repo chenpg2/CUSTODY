@@ -310,3 +310,54 @@ class TestEpsilonSubstantiation:
         result = verify_certificate(payload.cohort, payload.kernels, forged)
         assert not result.passed
         assert "epsilon_substantiated" in result.failed_checks
+
+
+class TestBalanceIsNotATautology:
+    """The balance count was unreachable, and the checker was repairing.
+
+    An overdraw was recorded as an orphan consumption, the running stock was
+    reset to zero, and the balance test was skipped. Every cohort the checker
+    had ever seen reported zero balance violations, whatever else was wrong
+    with it.
+    """
+
+    @staticmethod
+    def _patient(rows: list[tuple[str, int, int]]) -> pd.DataFrame:
+        """(kind, transferred, banked) per cycle, for one patient."""
+        return pd.DataFrame(
+            [
+                {
+                    "pid": "P1",
+                    "cycle_index": i,
+                    "cycle_kind": kind,
+                    "egg_num": 8 if kind == "fresh" else 0,
+                    "fertilization_num": 6 if kind == "fresh" else 0,
+                    "_2PN": 5 if kind == "fresh" else 0,
+                    "transfer_embryo_num": transferred,
+                    "freeze_num": banked,
+                }
+                for i, (kind, transferred, banked) in enumerate(rows)
+            ]
+        )
+
+    def test_a_deficit_is_counted(self) -> None:
+        frame = self._patient([("fresh", 2, 2), ("fet", 5, 0)])
+        assert check_ledger(frame).counts["I2_balance"] == 1
+
+    def test_the_deficit_persists_until_deposits_repay_it(self) -> None:
+        frame = self._patient([("fresh", 2, 2), ("fet", 5, 0), ("fresh", 1, 1), ("fet", 1, 0)])
+        counts = check_ledger(frame).counts
+        # Three cycles spent in deficit; two withdrawals that exceeded the
+        # stock available to them. Two different measurements.
+        assert counts["I2_balance"] == 3
+        assert counts["I3_no_orphan_consumption"] == 2
+
+    def test_a_conserving_cohort_still_reports_zero(self) -> None:
+        frame = self._patient([("fresh", 1, 3), ("fet", 2, 0), ("fet", 1, 0)])
+        assert check_ledger(frame).clean
+
+    def test_the_checker_no_longer_repairs_the_stock(self) -> None:
+        frame = self._patient([("fresh", 0, 1), ("fet", 5, 0), ("fet", 1, 0)])
+        counts = check_ledger(frame).counts
+        assert counts["I2_balance"] == 2
+        assert counts["I3_no_orphan_consumption"] == 2

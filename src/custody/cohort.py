@@ -115,20 +115,25 @@ def check_ledger(cohort: pd.DataFrame, schema: LedgerSchema | None = None) -> Le
         stock = 0.0
         deposited_yet = False
         for idx, row in rows.iterrows():
-            is_fresh = row[s.kind] == s.fresh_label
-            if is_fresh:
+            if row[s.kind] == s.fresh_label:
                 stock += float(row[s.banked])
                 if float(row[s.banked]) > 0:
                     deposited_yet = True
-                continue
-            draw = float(row[s.transferred])
-            if draw > 0 and not deposited_yet:
-                precedence.append(idx)  # withdrawal before any deposit exists
-            if draw > stock + 1e-9:
-                orphan.append(idx)  # consumes stock nobody banked
-                stock = 0.0
-                continue
-            stock -= draw
+            else:
+                draw = float(row[s.transferred])
+                if draw > 0 and not deposited_yet:
+                    precedence.append(idx)  # withdrawal before any deposit exists
+                if draw > stock + 1e-9:
+                    orphan.append(idx)  # consumes stock nobody banked
+                stock -= draw
+            # The running stock is carried as it falls, not reset. Resetting it
+            # to zero after an overdraw was a repair, inside the checker whose
+            # whole argument is that this system does not repair, and it hid two
+            # things. The balance count could never fire, because the overdraw
+            # branch caught every case that could drive the stock negative and
+            # then continued past this test. And the withdrawals that followed
+            # an overdraw were measured against a stock the patient did not
+            # have, so some of those went unrecorded too.
             if stock < -1e-9:
                 negative.append(idx)
     _record(report, "I2_balance", negative)
