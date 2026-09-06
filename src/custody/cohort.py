@@ -28,7 +28,9 @@ a generator can be scored (V1) and a payload can be refused (V2).
 
 from __future__ import annotations
 
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
 
@@ -79,7 +81,13 @@ class LedgerReport:
         }
 
 
-def _record(report: LedgerReport, name: str, offending: pd.Index | list[int]) -> None:
+def _record(report: LedgerReport, name: str, offending: pd.Index | Sequence[Any]) -> None:
+    """Store a violation count and the rows it came from.
+
+    The labels arrive from ``DataFrame.iterrows``, which the type system knows
+    only as ``Hashable``. They are row positions here, and they are coerced so
+    that a report serialises to JSON without carrying pandas types into it.
+    """
     idx = [int(i) for i in offending]
     report.counts[name] = len(idx)
     report.offenders[name] = idx
@@ -110,7 +118,9 @@ def check_ledger(cohort: pd.DataFrame, schema: LedgerSchema | None = None) -> Le
     _record(report, "I1_stage_monotone", bad)
 
     # I2/I3/I4 - walk each patient's sequence, holding the bank.
-    negative, orphan, precedence = [], [], []
+    negative: list[Hashable] = []
+    orphan: list[Hashable] = []
+    precedence: list[Hashable] = []
     for _pid, rows in frame.groupby(s.patient, sort=False):
         stock = 0.0
         deposited_yet = False

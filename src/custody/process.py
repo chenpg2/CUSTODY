@@ -154,7 +154,11 @@ def fit_kernels(fresh: pd.DataFrame, fet: pd.DataFrame) -> ProcessKernels:
     # never by presence: the demonstration centre has a handful of freeze_num rows and 80%
     # total_freeze_num, and picking the former banked nothing at all.
     candidates = [c for c in ("freeze_num", "total_freeze_num") if c in fresh.columns]
-    banked_col = max(candidates, key=lambda c: float((fresh[c].fillna(0) > 0).mean()))
+
+    def _coverage(column: str) -> float:
+        return float((fresh[column].fillna(0) > 0).to_numpy().mean())
+
+    banked_col = max(candidates, key=_coverage)
     surplus = fresh[fresh["_2PN"].fillna(0) > fresh["transfer_embryo_num"].fillna(0)]
     p_bank = _safe_rate(float((surplus[banked_col].fillna(0) > 0).sum()), float(len(surplus)), 0.5)
 
