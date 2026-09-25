@@ -22,6 +22,7 @@ do with it that it could not do alone. Three moving parts:
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -75,13 +76,21 @@ class Node:
     n_families: int = 0
     dp_record: dict[str, Any] = field(default_factory=dict)
 
-    def emit(self, *, n_patients: int, seed: int) -> Payload:
+    def emit(self, *, n_patients: int, seed: int, noise_seed: int | None = None) -> Payload:
         """Roll out a cohort and certify it. A corrupt node certifies, then lies."""
-        return emit_payload(self, n_patients=n_patients, seed=seed)
+        return emit_payload(self, n_patients=n_patients, seed=seed, noise_seed=noise_seed)
 
 
-def emit_payload(node: Node, *, n_patients: int, seed: int) -> Payload:
+def emit_payload(
+    node: Node, *, n_patients: int, seed: int, noise_seed: int | None = None
+) -> Payload:
     """Produce a node's payload; corrupt nodes tamper AFTER certification.
+
+    ``seed`` fixes the simulation. The privacy noise is drawn from the operating
+    system's cryptographic source unless ``noise_seed`` is given: whoever knows
+    a seed can regenerate the noise it drew, so seeded noise is for experiments
+    that must reproduce, never for a release made for others. Earlier versions
+    drew the noise from ``seed`` itself.
 
     Tampering after the certificate is issued is the realistic threat: the
     sender's own pipeline was honest, and something (a bug, a middlebox, a
@@ -105,7 +114,9 @@ def emit_payload(node: Node, *, n_patients: int, seed: int) -> Payload:
             n_families=node.n_families,
             config=node.dp,
             budget=budget,
-            rng=np.random.default_rng(seed),
+            rng=np.random.default_rng(
+                noise_seed if noise_seed is not None else secrets.randbits(128)
+            ),
         )
         node.dp_record = record
         epsilon_total, epsilon_cap = budget.spent, budget.cap_epsilon

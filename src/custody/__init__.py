@@ -243,7 +243,10 @@ class Centre:
         the cohort to the kernels, but no formal guarantee is claimed. With it,
         the kernels are privatised under the family unit first, and the epsilon
         on the certificate is what the accountant produced rather than what the
-        operator declared.
+        operator declared. The noise comes from the operating system's
+        cryptographic source and ``seed`` fixes only the simulation, so two
+        private releases with the same seed differ, as a release made for
+        others must.
 
         Raises:
             BudgetExhausted: if the release would carry the cumulative spend

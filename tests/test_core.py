@@ -212,6 +212,20 @@ class TestDPRelease:
             n_families=1000,
         )
 
+    def test_private_noise_does_not_follow_the_simulation_seed(
+        self, kernels: ProcessKernels
+    ) -> None:
+        """A release made for others must not be reproducible from a seed it carries."""
+        first = self._node(kernels).emit(n_patients=80, seed=1).kernels
+        second = self._node(kernels).emit(n_patients=80, seed=1).kernels
+        assert first["fert_rate"] != second["fert_rate"]
+
+    def test_an_explicit_noise_seed_reproduces(self, kernels: ProcessKernels) -> None:
+        """Experiments that must reproduce pass the noise seed explicitly."""
+        first = self._node(kernels).emit(n_patients=80, seed=5, noise_seed=5).kernels
+        second = self._node(kernels).emit(n_patients=80, seed=5, noise_seed=5).kernels
+        assert first == second
+
     def test_noise_is_actually_applied(self, kernels: ProcessKernels) -> None:
         node = self._node(kernels)
         released = node.emit(n_patients=100, seed=1).kernels
