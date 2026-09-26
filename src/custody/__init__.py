@@ -151,7 +151,9 @@ class Release:
     def verify(self) -> Verification:
         """Verify the certificate the way a receiving centre would.
 
-        Every field is recomputed on what arrived. A payload edited in flight
+        The digests, the counts and the ledger are recomputed on what arrived,
+        and the privacy budget, which no receiver can recompute, is refused
+        unless its cap and delta substantiate it. A payload edited in flight
         fails on the digest; one edited and re-certified still fails on the
         invariants, which is the check that does not depend on the sender.
         """
@@ -383,7 +385,7 @@ class Delivery:
 class Receiver:
     """The receiving centre.
 
-    It is told nothing about which sender to distrust. It recomputes every
+    It is told nothing about which sender to distrust. It checks every
     certificate on what arrived, refuses what fails, merges the rest with its
     own fitted process, and replays a cohort under its own policy.
     """

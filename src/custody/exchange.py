@@ -11,7 +11,8 @@ do with it that it could not do alone. Three moving parts:
 
 :class:`Payload`
     Kernels + a synthetic cohort + the release certificate. Self-describing
-    and self-verifiable: the receiver recomputes every claim it makes.
+    and checkable by its receiver: the digests, counts and ledger are
+    recomputed, and the budget is refused unless it is substantiated.
 
 :func:`receive`
     The receiver's protocol: verify each payload, DISCARD the ones that fail,

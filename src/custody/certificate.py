@@ -58,7 +58,9 @@ def kernel_digest(kernels: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class Certificate:
-    """What travels beside a payload. Every field is receiver-checkable."""
+    """What travels beside a payload. A receiver recomputes the digests and counts,
+    checks that the budget is substantiated, and does not check the role shares or
+    the release count, which are recorded for the reader."""
 
     cohort_sha256: str
     kernel_sha256: str
@@ -155,7 +157,11 @@ def verify_certificate(
     schema: LedgerSchema | None = None,
     expected_unit: str | None = None,
 ) -> CertificateResult:
-    """Recompute every claim the certificate makes. No check is trusted.
+    """Check a certificate against the payload it came with.
+
+    The digests, the counts and the ledger are recomputed on the payload. The
+    spent budget cannot be, since the receiver never sees the noise, and it is
+    refused unless the cap and delta that substantiate it are declared beside it.
 
     Args:
         expected_unit: The receiver's own accounting-unit policy. When given, a

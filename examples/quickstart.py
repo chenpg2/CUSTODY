@@ -117,7 +117,7 @@ def main() -> int:
     print(f"    verified: {checked.accepted}, refused on {', '.join(checked.failed)}")
 
     # A fourth centre receives all three. It is told nothing about which to
-    # distrust: it recomputes every certificate on what arrived.
+    # distrust: it checks every certificate on what arrived.
     receiver = Receiver(Centre.fit(fresh, fet, name="Centre_9"), replay_patients=500)
     delivery = receiver.receive([plain, private, tampered])
     print(f"\n  receiver accepted {delivery.accepted}")
