@@ -8,7 +8,7 @@ framework expects.
 
 Run it with::
 
-    python examples/custody_quickstart.py
+    python examples/quickstart.py
 """
 
 from __future__ import annotations
@@ -82,8 +82,16 @@ def main() -> int:
     fresh, fet = fabricate()
     print(f"input cohort: {len(fresh)} fresh cycles, {len(fet)} frozen transfers\n")
 
-    # Three centres fit their own process. The records never leave.
-    senders = [Centre.fit(fresh, fet, name=f"Centre_{i}") for i in (1, 2, 3)]
+    # Three centres fit their own process. The records never leave. Centre_2
+    # will release under privacy, so it fits on each family's first six cycles:
+    # the noise is calibrated to that bound, and a private release from a fit
+    # without it is refused.
+    privacy = Privacy(epsilon=1.0, cap=5.0)
+    senders = [
+        Centre.fit(fresh, fet, name="Centre_1"),
+        Centre.fit(fresh, fet, name="Centre_2", privacy=privacy),
+        Centre.fit(fresh, fet, name="Centre_3"),
+    ]
     for centre in senders:
         print(f"  {centre}")
 
@@ -95,7 +103,7 @@ def main() -> int:
 
     # Centre_2 releases under family-unit differential privacy. The epsilon on
     # the certificate is what the accountant produced, not what was asked for.
-    private = senders[1].release(n_patients=400, seed=7, privacy=Privacy(epsilon=1.0, cap=5.0))
+    private = senders[1].release(n_patients=400, seed=7, privacy=privacy)
     print(f"  {private}")
     print(f"    asked for epsilon 1.0, accountant charged {private.epsilon:.4f}")
     print(f"    ledger clean: {private.check().clean}    verified: {private.verify().accepted}")

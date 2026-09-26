@@ -100,15 +100,25 @@ def emit_payload(
     Raises:
         BudgetExhausted: when the node's cumulative family-unit spend would
             pass its declared cap. A node out of budget refuses to release.
+        ValueError: when a node without privacy settings holds kernels fitted
+            for private release, or a node with them holds kernels fitted
+            without a contribution cap at or below its bound.
     """
     kernels = node.kernels
+    if node.dp is None and kernels.contribution_cap is not None:
+        # A capped fit is one made for private release, and a plain payload would
+        # publish it exactly: what the private releases protect.
+        raise ValueError(
+            f"{node.node_id}'s kernels were fitted for private release, on at most "
+            f"{kernels.contribution_cap} cycles per family; a plain payload would publish "
+            f"them exactly. Give the node its privacy settings to release them."
+        )
     epsilon_total, epsilon_cap, delta, releases = None, None, None, 1
     if node.dp is not None:
         budget = node.budget or FamilyBudget(
             cap_epsilon=node.dp.epsilon,
             delta=node.dp.resolved_delta(node.n_families),
         )
-        node.budget = budget
         kernels, record = privatise_kernels(
             node.kernels,
             n_families=node.n_families,
@@ -118,6 +128,7 @@ def emit_payload(
                 noise_seed if noise_seed is not None else secrets.randbits(128)
             ),
         )
+        node.budget = budget  # only once the release is priced: a refusal leaves none
         node.dp_record = record
         epsilon_total, epsilon_cap = budget.spent, budget.cap_epsilon
         delta, releases = budget.delta, budget.releases
@@ -151,8 +162,12 @@ def merge_kernels(kernels: list[ProcessKernels]) -> ProcessKernels:
     if not kernels:
         raise ValueError("no verified kernels to merge")
     stack = lambda attr: np.mean([getattr(k, attr) for k in kernels], axis=0)  # noqa: E731
+    # The merge is capped only if every input was, and then at the loosest cap:
+    # taking the first input's cap let an uncapped fit pass as a capped one.
+    caps = [k.contribution_cap for k in kernels]
     return replace(
         kernels[0],
+        contribution_cap=None if None in caps else max(c for c in caps if c is not None),
         covariate_pool=np.vstack([k.covariate_pool for k in kernels]),
         yield_beta=stack("yield_beta"),
         yield_alpha=float(stack("yield_alpha")),

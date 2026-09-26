@@ -63,6 +63,54 @@ def kernels() -> ProcessKernels:
     )
 
 
+def _as_capped(kernels: ProcessKernels, cap: int = 6) -> ProcessKernels:
+    """The hand-set fixture, declared as a fit capped at K cycles per family.
+
+    A private release refuses kernels fitted without a contribution cap. The
+    fixture is not fitted from data, so it stands in for kernels that were.
+    """
+    from dataclasses import replace
+
+    return replace(kernels, contribution_cap=cap)
+
+
+def _small_cohort() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Eighty synthetic patients; the first has eight fresh cycles, past a cap of six."""
+    rng = np.random.default_rng(0)
+    fresh_rows, fet_rows = [], []
+    for p in range(80):
+        for c in range(8 if p == 0 else int(rng.integers(1, 3))):
+            eggs = int(rng.poisson(10))
+            fert = int(rng.binomial(eggs, 0.7))
+            pn = int(rng.binomial(fert, 0.8))
+            transfer, freeze = min(2, pn), max(0, pn - min(2, pn))
+            date = pd.Timestamp("2020-01-01") + pd.Timedelta(days=90 * c)
+            fresh_rows.append(
+                {
+                    "pid": f"p{p}",
+                    "visit_date": date,
+                    "age_w": float(rng.uniform(25, 40)),
+                    "AF": float(rng.uniform(4, 20)),
+                    "egg_num": eggs,
+                    "fertilization_num": fert,
+                    "_2PN": pn,
+                    "transfer_embryo_num": transfer,
+                    "freeze_num": freeze,
+                    "live_birth": int(transfer > 0 and rng.random() < 0.3),
+                }
+            )
+            if freeze:
+                fet_rows.append(
+                    {
+                        "pid": f"p{p}",
+                        "visit_date": date + pd.Timedelta(days=45),
+                        "transfer_embryo_num": 1,
+                        "live_birth": int(rng.random() < 0.4),
+                    }
+                )
+    return pd.DataFrame(fresh_rows), pd.DataFrame(fet_rows)
+
+
 class TestInvariants:
     def test_honest_sequence_is_clean(self) -> None:
         frame = pd.DataFrame(
@@ -206,7 +254,7 @@ class TestDPRelease:
         cfg = DPConfig(epsilon=epsilon)
         return Node(
             "n",
-            kernels,
+            _as_capped(kernels, cfg.max_cycles_per_family),
             dp=cfg,
             budget=FamilyBudget(cap_epsilon=cap, delta=cfg.resolved_delta(1000)),
             n_families=1000,
@@ -218,7 +266,9 @@ class TestDPRelease:
         """A release made for others must not be reproducible from a seed it carries."""
         first = self._node(kernels).emit(n_patients=80, seed=1).kernels
         second = self._node(kernels).emit(n_patients=80, seed=1).kernels
-        assert first["fert_rate"] != second["fert_rate"]
+        # The whole release, not one rate: at this noise scale a rate clips to the
+        # same bound on both draws about one run in ten, and the test then failed.
+        assert first != second
 
     def test_an_explicit_noise_seed_reproduces(self, kernels: ProcessKernels) -> None:
         """Experiments that must reproduce pass the noise seed explicitly."""
@@ -258,7 +308,7 @@ class TestDPRelease:
 
         cfg = DPConfig(epsilon=1.0)
         private, _ = privatise_kernels(
-            kernels,
+            _as_capped(kernels),
             n_families=1000,
             config=cfg,
             budget=FamilyBudget(cap_epsilon=5.0, delta=cfg.resolved_delta(1000)),
@@ -266,6 +316,152 @@ class TestDPRelease:
         )
         assert private.covariate_pool.shape == kernels.covariate_pool.shape
         assert not np.array_equal(private.covariate_pool, kernels.covariate_pool)
+
+    def test_uncapped_kernels_are_refused(self, kernels: ProcessKernels) -> None:
+        """The noise assumes at most K cycles per family, so a fit must say it capped."""
+        from custody import DPConfig, FamilyBudget, privatise_kernels
+
+        cfg = DPConfig(epsilon=1.0)
+        for bad in (kernels, _as_capped(kernels, cfg.max_cycles_per_family + 2)):
+            with pytest.raises(ValueError, match="contribution cap"):
+                privatise_kernels(
+                    bad,
+                    n_families=1000,
+                    config=cfg,
+                    budget=FamilyBudget(cap_epsilon=5.0, delta=cfg.resolved_delta(1000)),
+                    rng=np.random.default_rng(0),
+                )
+
+    def test_a_refused_release_draws_nothing_and_is_charged_nothing(
+        self, kernels: ProcessKernels
+    ) -> None:
+        """The histogram used to be charged after the kernel noise was drawn."""
+        from custody import BudgetExhausted, DPConfig, FamilyBudget, privatise_kernels
+
+        cfg = DPConfig(epsilon=1.0)
+        probe = FamilyBudget(cap_epsilon=5.0, delta=cfg.resolved_delta(1000))
+        privatise_kernels(
+            _as_capped(kernels),
+            n_families=1000,
+            config=cfg,
+            budget=probe,
+            rng=np.random.default_rng(0),
+        )
+        one_release = probe.spent
+        budget = FamilyBudget(cap_epsilon=1.2 * one_release, delta=cfg.resolved_delta(1000))
+        privatise_kernels(
+            _as_capped(kernels),
+            n_families=1000,
+            config=cfg,
+            budget=budget,
+            rng=np.random.default_rng(1),
+        )
+        spent, releases = budget.spent, budget.releases
+        rng = np.random.default_rng(2)
+        state = rng.bit_generator.state
+        with pytest.raises(BudgetExhausted):
+            privatise_kernels(
+                _as_capped(kernels), n_families=1000, config=cfg, budget=budget, rng=rng
+            )
+        assert (budget.spent, budget.releases) == (spent, releases)
+        assert rng.bit_generator.state == state
+
+    def test_a_capped_fit_keeps_each_family_to_its_first_k_cycles(self) -> None:
+        from custody import cap_contributions, fit_kernels
+
+        fresh, fet = _small_cohort()
+        capped_fresh, capped_fet, dropped = cap_contributions(fresh, fet, max_cycles=6)
+        per_family = pd.concat([capped_fresh["pid"], capped_fet["pid"]]).value_counts()
+        assert per_family.max() == 6
+        assert dropped == len(fresh) + len(fet) - len(capped_fresh) - len(capped_fet)
+        # The first six in visit order, and the frames keep their own columns.
+        first = pd.concat([fresh, fet])
+        first = first[first["pid"] == "p0"].sort_values("visit_date").head(6)
+        kept = pd.concat([capped_fresh, capped_fet])
+        assert sorted(kept[kept["pid"] == "p0"]["visit_date"]) == sorted(first["visit_date"])
+        assert list(capped_fresh.columns) == list(fresh.columns)
+        assert list(capped_fet.columns) == list(fet.columns)
+        assert set(kept["pid"]) == set(first["pid"]) | set(fresh["pid"])  # no family lost
+        assert fit_kernels(fresh, fet, contribution_cap=6).contribution_cap == 6
+        assert fit_kernels(fresh, fet).contribution_cap is None
+
+    def test_capping_orders_by_date_even_with_no_frozen_transfers(self) -> None:
+        """A centre with no transfers used to have its cycles kept in storage order."""
+        from custody import cap_contributions
+
+        dates = pd.to_datetime(["2020-04-01", "2020-03-01", "2020-02-01", "2020-01-01"])
+        fresh = pd.DataFrame({"pid": ["p"] * 4, "visit_date": dates})
+        capped, _, dropped = cap_contributions(fresh, pd.DataFrame(), max_cycles=2)
+        assert sorted(capped["visit_date"]) == list(dates[[3, 2]])
+        assert dropped == 2
+
+    def test_a_fresh_cycle_comes_before_a_transfer_on_the_same_date(self) -> None:
+        from custody import cap_contributions
+
+        day = pd.Timestamp("2020-01-01")
+        fresh = pd.DataFrame({"pid": ["p"], "visit_date": [day]})
+        fet = pd.DataFrame({"pid": ["p"], "visit_date": [day]})
+        capped_fresh, capped_fet, _ = cap_contributions(fresh, fet, max_cycles=1)
+        assert (len(capped_fresh), len(capped_fet)) == (1, 0)
+
+    def test_capping_refuses_to_guess_an_order(self) -> None:
+        from custody import cap_contributions
+
+        undated = pd.DataFrame({"pid": ["p", "p"]})
+        gap = pd.DataFrame({"pid": ["p", "p"], "visit_date": [pd.Timestamp("2020-01-01"), None]})
+        text = pd.DataFrame({"pid": ["p", "p"], "visit_date": ["12/01/2019", "02/01/2020"]})
+        for fresh in (undated, gap, text):
+            with pytest.raises(ValueError, match="visit_date"):
+                cap_contributions(fresh, pd.DataFrame(), max_cycles=1)
+        nameless = pd.DataFrame(
+            {"pid": ["p", None], "visit_date": pd.to_datetime(["2020-01-01", "2020-02-01"])}
+        )
+        with pytest.raises(ValueError, match="pid"):
+            cap_contributions(nameless, pd.DataFrame(), max_cycles=1)
+
+    def test_the_bound_is_a_whole_number_of_cycles(self) -> None:
+        """A bound of 2.5 kept three cycles and priced two."""
+        from custody import DPConfig, Privacy, cap_contributions
+
+        fresh, fet = _small_cohort()
+        for bad in (0, -1, 2.5, True):
+            with pytest.raises(ValueError, match="whole number"):
+                cap_contributions(fresh, fet, max_cycles=bad)  # type: ignore[arg-type]
+            with pytest.raises(ValueError, match="whole number"):
+                DPConfig(max_cycles_per_family=bad)  # type: ignore[arg-type]
+            with pytest.raises(ValueError, match="whole number"):
+                Privacy(max_cycles=bad)  # type: ignore[arg-type]
+
+    def test_a_fit_does_not_depend_on_the_index(self) -> None:
+        """A repeated index label paired one covariate row with several outcomes."""
+        from custody import fit_kernels
+
+        fresh, fet = _small_cohort()
+        repeated = fresh.set_axis(np.arange(len(fresh)) // 2)
+        for cap in (None, 6):
+            assert (
+                fit_kernels(repeated, fet, contribution_cap=cap).as_dict()
+                == fit_kernels(fresh, fet, contribution_cap=cap).as_dict()
+            )
+
+    def test_capped_kernels_do_not_leave_as_a_plain_payload(self, kernels: ProcessKernels) -> None:
+        with pytest.raises(ValueError, match="fitted for private release"):
+            Node("n", _as_capped(kernels)).emit(n_patients=80, seed=1)
+
+    def test_a_refused_node_is_left_without_a_budget(self, kernels: ProcessKernels) -> None:
+        from custody import DPConfig
+
+        node = Node("n", kernels, dp=DPConfig(epsilon=1.0), n_families=1000)
+        with pytest.raises(ValueError, match="contribution cap"):
+            node.emit(n_patients=80, seed=1)
+        assert node.budget is None
+
+    def test_a_merge_is_capped_only_if_every_input_was(self, kernels: ProcessKernels) -> None:
+        """The merge used to take the first input's cap, whatever the others were."""
+        capped, uncapped = _as_capped(kernels, 6), kernels
+        assert merge_kernels([capped, uncapped]).contribution_cap is None
+        assert merge_kernels([uncapped, capped]).contribution_cap is None
+        assert merge_kernels([_as_capped(kernels, 4), capped]).contribution_cap == 6
 
     def test_contribution_capping_bounds_a_family(self) -> None:
         from custody import cap_contributions
@@ -312,7 +508,7 @@ class TestEpsilonSubstantiation:
         cfg = DPConfig(epsilon=1.0)
         node = Node(
             "n",
-            kernels,
+            _as_capped(kernels, cfg.max_cycles_per_family),
             dp=cfg,
             budget=FamilyBudget(cap_epsilon=2.0, delta=cfg.resolved_delta(1000)),
             n_families=1000,

@@ -88,6 +88,10 @@ class ProcessKernels:
     fet_transfer_mean: float
     fet_live_birth_rate: float  # FET transfers have their own outcome rate
     p_fresh_transfer: float  # else freeze-all: the whole cohort goes to the bank
+    # The contribution cap the fit applied, or None for a fit on every cycle.
+    # Not a released parameter, so it is not in as_dict and not in the digest;
+    # privatise_kernels reads it and refuses kernels fitted without one.
+    contribution_cap: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -115,13 +119,20 @@ def _safe_rate(numerator: float, denominator: float, default: float) -> float:
     return float(np.clip(numerator / denominator, 1e-4, 1 - 1e-4))
 
 
-def fit_kernels(fresh: pd.DataFrame, fet: pd.DataFrame) -> ProcessKernels:
+def fit_kernels(
+    fresh: pd.DataFrame, fet: pd.DataFrame, *, contribution_cap: int | None = None
+) -> ProcessKernels:
     """Fit the process from one centre's cycles. Classical estimators only.
 
     Args:
         fresh: Fresh cycles with age_w, AF, egg_num, fertilization_num, _2PN,
             transfer_embryo_num, freeze_num (or total_freeze_num), live_birth.
         fet: Frozen-transfer cycles with transfer_embryo_num.
+        contribution_cap: Keep each family's first this-many cycles, in visit
+            order, before fitting, and record the cap on the kernels. Required
+            for kernels that will be privatised: the noise is calibrated to a
+            family contributing at most that many cycles. Both frames then need
+            a visit_date on every row.
 
     Returns:
         :class:`ProcessKernels`.
@@ -129,9 +140,18 @@ def fit_kernels(fresh: pd.DataFrame, fet: pd.DataFrame) -> ProcessKernels:
     import statsmodels.api as sm
     from statsmodels.discrete.discrete_model import NegativeBinomial
 
-    cov = fresh[["age_w", "AF"]].dropna()
+    if contribution_cap is not None:
+        from .privacy import cap_contributions  # imported here: privacy imports this module
+
+        fresh, fet, _dropped = cap_contributions(fresh, fet, contribution_cap)
+
+    # Rows are matched by position, not by index label: an index that repeats a
+    # label would otherwise pair one covariate row with several outcomes.
+    covariates = fresh[["age_w", "AF"]]
+    observed = covariates.notna().all(axis=1).to_numpy()
+    cov = covariates[observed]
     design = yield_design(cov["age_w"].to_numpy(), cov["AF"].to_numpy())
-    eggs = fresh.loc[cov.index, "egg_num"].to_numpy(float)
+    eggs = fresh["egg_num"].to_numpy(float)[observed]
     try:
         nb = NegativeBinomial(eggs, design).fit(disp=0, maxiter=200)
         yield_beta, yield_alpha = np.asarray(nb.params)[:-1], float(np.asarray(nb.params)[-1])
@@ -191,6 +211,7 @@ def fit_kernels(fresh: pd.DataFrame, fet: pd.DataFrame) -> ProcessKernels:
         p_fresh_transfer=_safe_rate(
             float((fresh["transfer_embryo_num"].fillna(0) > 0).sum()), float(len(fresh)), 0.7
         ),
+        contribution_cap=contribution_cap,
     )
 
 

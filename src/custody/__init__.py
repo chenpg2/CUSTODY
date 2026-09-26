@@ -10,8 +10,9 @@ Four objects carry the whole path::
 
     from custody import Centre, Privacy, Receiver
 
-    sender   = Centre.fit(fresh, fet, name="Centre_1")
-    release  = sender.release(n_patients=500, privacy=Privacy(epsilon=1.0))
+    privacy  = Privacy(epsilon=1.0)
+    sender   = Centre.fit(fresh, fet, name="Centre_1", privacy=privacy)
+    release  = sender.release(n_patients=500, privacy=privacy)
     release.verify().accepted        # what the receiver will conclude
 
     receiver = Receiver(Centre.fit(own_fresh, own_fet, name="Centre_2"))
@@ -48,12 +49,13 @@ from .privacy import (
     BudgetExhausted,
     DPConfig,
     FamilyBudget,
+    _check_cycle_bound,
     cap_contributions,
     privatise_kernels,
 )
 from .process import ProcessKernels, RolloutConfig, fit_kernels, rollout_cohort
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 DEFAULT_PATIENTS = 500
 DEFAULT_SEED = 42
@@ -77,6 +79,9 @@ class Privacy:
     delta: float | None = None
     max_cycles: int = 6
     cap: float | None = None
+
+    def __post_init__(self) -> None:
+        _check_cycle_bound(self.max_cycles, "max_cycles")
 
     def _config(self) -> DPConfig:
         return DPConfig(
@@ -114,6 +119,9 @@ class Release:
     Nothing in ``cohort`` corresponds to a person. It is rolled out from a
     fitted process, and the certificate is what lets a receiver establish that
     for itself rather than take it on trust.
+
+    ``epsilon`` is the centre's cumulative spend once this release is made,
+    across every release it has made, and None for a plain release.
     """
 
     cohort: pd.DataFrame
@@ -170,6 +178,13 @@ class Centre:
     them. The records never leave: what a release carries is the fitted process
     and a cohort simulated from it.
 
+    A centre is fitted for plain or for private release and releases only that
+    way. A plain release publishes the fitted kernels exactly, so one centre
+    releasing both would publish what its private releases protect. The release
+    mode and the budget belong to this object: a second centre fitted on the same
+    records starts a budget that knows nothing of this one, which the library
+    cannot see and the caller must not do.
+
     A centre that releases under privacy carries its budget across releases. The
     spend accumulates, and a release that would cross the cap is refused rather
     than quietly weakened.
@@ -195,15 +210,18 @@ class Centre:
         :class:`custody.LedgerSchema` names, plus ``age_w``, ``AF``,
         ``visit_date`` and ``live_birth``.
 
-        Passing ``privacy`` applies contribution bounding before the fit, so a
-        family contributes at most its first K cycles. The bound is what makes
-        the sensitivity finite; it also removes failures selectively, which the
-        paper states and does not correct for.
+        Passing ``privacy`` fits on each family's first K cycles
+        (``privacy.max_cycles``) and makes this a centre that releases only
+        under privacy. The bound is what makes the sensitivity finite; it also
+        removes failures selectively, which the paper states and does not
+        correct for. Capping keeps every family, so the family count the budget
+        is priced against is the same either way.
         """
+        # Until 1.1.0 this counted the cycles capping dropped as the families,
+        # which priced delta and the sensitivities against the wrong number.
         n_families = int(pd.concat([fresh, fet])["pid"].nunique())
-        if privacy is not None:
-            fresh, fet, n_families = cap_contributions(fresh, fet, privacy.max_cycles)
-        return cls(fit_kernels(fresh, fet), name=name, n_families=n_families)
+        cap = privacy.max_cycles if privacy is not None else None
+        return cls(fit_kernels(fresh, fet, contribution_cap=cap), name=name, n_families=n_families)
 
     @property
     def kernels(self) -> ProcessKernels:
@@ -248,31 +266,76 @@ class Centre:
         private releases with the same seed differ, as a release made for
         others must.
 
+        A centre releases the way it was fitted. ``privacy`` is required from a
+        centre fitted with it and refused from one fitted without it, and both
+        are checked before anything about the centre changes.
+
         Raises:
             BudgetExhausted: if the release would carry the cumulative spend
-                past the cap. Nothing is emitted and no noise is drawn.
+                past the cap. Nothing is emitted, no noise is drawn and nothing
+                is charged.
+            ValueError: if ``privacy`` does not match how the centre was
+                fitted, or asks for a bound tighter than the fit applied.
         """
-        if privacy is not None:
-            self._node.dp = privacy._config()
-            requested_cap = privacy.cap if privacy.cap is not None else privacy.epsilon
-            if self._node.budget is None:
-                self._node.budget = FamilyBudget(
-                    cap_epsilon=requested_cap,
-                    delta=privacy._config().resolved_delta(self.n_families),
-                )
-            elif requested_cap != self._node.budget.cap_epsilon:
-                # The cap is the centre's cumulative ceiling, fixed when it first
-                # released. Honouring a new one would rewrite the budget the
-                # earlier certificates were issued against; ignoring it silently
-                # would let a caller tighten the cap, watch the release succeed,
-                # and report a ceiling that was never enforced.
-                raise ValueError(
-                    f"this centre is already releasing against a cap of "
-                    f"{self._node.budget.cap_epsilon}, and {requested_cap} was asked "
-                    f"for. A cumulative budget cannot be re-ceilinged part way "
-                    f"through; build a new Centre to release under a different cap."
-                )
-        payload = self._node.emit(n_patients=n_patients, seed=seed)
+        if n_patients < 1:
+            raise ValueError(f"a release needs at least one patient; {n_patients} was asked for")
+        cap = self.kernels.contribution_cap
+        if privacy is None and cap is not None:
+            # Until 1.1.0 this silently released under the previous release's
+            # privacy settings, and charged the budget for it.
+            raise ValueError(
+                f"{self.name} was fitted for private release, on at most {cap} cycles per "
+                f"family. A plain release would publish, exactly, the kernels its private "
+                f"releases protect; pass the privacy it releases under."
+            )
+        if privacy is not None and cap is None:
+            raise ValueError(
+                f"a private release needs kernels fitted on at most {privacy.max_cycles} "
+                f"cycles per family, and {self.name} was fitted without a contribution cap. "
+                f"A centre that releases privately is fitted with Centre.fit(fresh, fet, "
+                f"privacy=Privacy(...)); a plain release already made from the same records "
+                f"is not protected by it."
+            )
+        if privacy is not None and cap is not None and cap > privacy.max_cycles:
+            raise ValueError(
+                f"{self.name} was fitted on at most {cap} cycles per family, and this release "
+                f"asks for at most {privacy.max_cycles}: the noise would be calibrated to fewer "
+                f"cycles than a family contributes. Release with max_cycles of at least {cap}."
+            )
+        if privacy is None:
+            payload = self._node.emit(n_patients=n_patients, seed=seed)
+            return Release._from_payload(payload, epsilon=None, accounting={})
+        config = privacy._config()
+        requested_cap = privacy.cap if privacy.cap is not None else privacy.epsilon
+        budget = self._node.budget
+        if budget is not None and requested_cap != budget.cap_epsilon:
+            # The cap is the centre's cumulative ceiling, fixed when it first
+            # released. Honouring a new one would rewrite the budget the earlier
+            # certificates were issued against; ignoring it silently would let a
+            # caller tighten the cap, watch the release succeed, and report a
+            # ceiling that was never enforced.
+            raise ValueError(
+                f"this centre is already releasing against a cap of {budget.cap_epsilon}, "
+                f"and {requested_cap} was asked for. A cumulative budget cannot be "
+                f"re-ceilinged part way through, and a new Centre fitted on the same records "
+                f"would start a budget that knows nothing of this one."
+            )
+        # A refused release leaves the centre as it was: nothing was drawn, charged
+        # or published, so no cap is fixed and no settings change. A release that
+        # fails after it was priced also restores the settings, and a charge it
+        # made on a budget that already existed stays: the spend is overstated,
+        # never under.
+        previous = (self._node.dp, self._node.budget)
+        self._node.dp = config
+        if budget is None:
+            self._node.budget = FamilyBudget(
+                cap_epsilon=requested_cap, delta=config.resolved_delta(self.n_families)
+            )
+        try:
+            payload = self._node.emit(n_patients=n_patients, seed=seed)
+        except Exception:
+            self._node.dp, self._node.budget = previous
+            raise
         spent = None if self._node.budget is None else float(self._node.budget.spent)
         return Release._from_payload(payload, epsilon=spent, accounting=dict(self._node.dp_record))
 

@@ -23,6 +23,10 @@ from custody import (
     Verification,
 )
 
+# What the private tests release under. A centre releases the way it was fitted,
+# so the ones that release privately are fitted with it too.
+PRIVACY = Privacy(epsilon=1.0, cap=5.0)
+
 
 class TestCentre:
     def test_fit_counts_the_families_it_will_price_privacy_against(self, cohort):
@@ -71,8 +75,8 @@ class TestRelease:
 
 class TestPrivacy:
     def test_the_epsilon_is_produced_not_declared(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
-        release = centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        release = centre.release(200, seed=5, privacy=PRIVACY)
         assert release.private
         # The accountant's number, which is not the epsilon that was asked for.
         assert release.epsilon is not None
@@ -80,28 +84,76 @@ class TestPrivacy:
         assert 0.0 < release.epsilon < 1.0
 
     def test_spend_accumulates_across_releases(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
-        first = centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
-        second = centre.release(200, seed=6, privacy=Privacy(epsilon=1.0, cap=5.0))
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        first = centre.release(200, seed=5, privacy=PRIVACY)
+        second = centre.release(200, seed=6, privacy=PRIVACY)
         assert second.epsilon > first.epsilon
         assert centre.spent == pytest.approx(second.epsilon)
 
     def test_a_release_past_the_cap_is_refused_and_costs_nothing(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=Privacy())
         with pytest.raises(BudgetExhausted):
             centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=1e-6))
         assert centre.spent == 0.0
 
     def test_a_private_release_still_conserves_the_ledger(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
-        release = centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        release = centre.release(200, seed=5, privacy=PRIVACY)
         assert release.check().clean and release.verify().accepted
 
-    def test_contribution_bounding_can_only_shrink_the_family_count(self, cohort):
+    def test_contribution_bounding_keeps_every_family(self, cohort):
+        """Until 1.1.0 the fit counted the cycles capping dropped as the families."""
         fresh, fet = cohort
-        plain = Centre.fit(fresh, fet)
+        families = pd.concat([fresh["pid"], fet["pid"]]).nunique()
         bounded = Centre.fit(fresh, fet, privacy=Privacy(epsilon=1.0, max_cycles=1))
-        assert bounded.n_families <= plain.n_families
+        assert bounded.n_families == Centre.fit(fresh, fet).n_families == families
+
+
+class TestReleaseMode:
+    """A centre releases the way it was fitted, and a mismatch changes nothing."""
+
+    def test_a_plain_fit_cannot_release_privately(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1")
+        with pytest.raises(ValueError, match="without a contribution cap"):
+            centre.release(200, seed=5, privacy=PRIVACY)
+        assert centre.spent == 0.0
+        assert not centre.release(200, seed=5).private
+
+    def test_a_private_centre_cannot_release_plainly(self, cohort):
+        """Until 1.1.0 this silently released under the previous release's privacy."""
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        centre.release(200, seed=5, privacy=PRIVACY)
+        spent = centre.spent
+        with pytest.raises(ValueError, match="fitted for private release"):
+            centre.release(200, seed=6)
+        assert centre.spent == spent
+
+    def test_a_bound_tighter_than_the_fit_is_refused(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=Privacy(max_cycles=6))
+        with pytest.raises(ValueError, match="max_cycles of at least 6"):
+            centre.release(200, seed=5, privacy=Privacy(max_cycles=3, cap=5.0))
+        assert centre.spent == 0.0
+
+    def test_an_empty_release_is_refused_before_it_is_priced(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        with pytest.raises(ValueError, match="at least one patient"):
+            centre.release(0, seed=5, privacy=PRIVACY)
+        assert centre.spent == 0.0 and centre.as_node().budget is None
+
+    def test_a_refused_first_release_fixes_no_cap(self, cohort):
+        """Nothing was released, so the next release may still choose its ceiling."""
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        with pytest.raises(BudgetExhausted):
+            centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=1e-6))
+        assert centre.release(200, seed=5, privacy=PRIVACY).private
+
+    def test_a_refused_re_ceiling_leaves_the_settings_as_they_were(self, cohort):
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        first = centre.release(200, seed=5, privacy=PRIVACY)
+        with pytest.raises(ValueError, match="cannot be re-ceilinged"):
+            centre.release(200, seed=6, privacy=Privacy(epsilon=9.0, cap=0.001))
+        assert centre.as_node().dp == PRIVACY._config()
+        assert centre.spent == pytest.approx(first.epsilon)
 
 
 class TestReceiver:
@@ -142,19 +194,19 @@ class TestBudgetCeiling:
     """The cap is the centre's ceiling, and it cannot move underfoot."""
 
     def test_a_changed_cap_is_refused_rather_than_ignored(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
-        centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        centre.release(200, seed=5, privacy=PRIVACY)
         with pytest.raises(ValueError, match="cannot be re-ceilinged"):
             centre.release(200, seed=6, privacy=Privacy(epsilon=1.0, cap=0.001))
 
     def test_the_same_cap_keeps_releasing(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
-        first = centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=5.0))
-        second = centre.release(200, seed=6, privacy=Privacy(epsilon=1.0, cap=5.0))
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        first = centre.release(200, seed=5, privacy=PRIVACY)
+        second = centre.release(200, seed=6, privacy=PRIVACY)
         assert second.epsilon > first.epsilon
 
     def test_a_fresh_centre_enforces_a_tight_cap_from_the_first_release(self, cohort):
-        centre = Centre.fit(*cohort, name="Centre_1")
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=Privacy())
         with pytest.raises(BudgetExhausted):
             centre.release(200, seed=5, privacy=Privacy(epsilon=1.0, cap=0.001))
         assert centre.spent == 0.0

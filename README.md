@@ -29,12 +29,14 @@ pyarrow. No patient data is required for anything in this repository.
 ```python
 from custody import Centre, Privacy, Receiver
 
-# A centre fits its own process. Its records never leave.
-sender = Centre.fit(fresh, fet, name="Centre_1")
+# A centre fits its own process. Its records never leave. One that will release
+# under privacy is fitted with it, on each family's first K cycles.
+privacy = Privacy(epsilon=1.0, cap=5.0)
+sender = Centre.fit(fresh, fet, name="Centre_1", privacy=privacy)
 
 # It releases a synthetic cohort under a certificate.
-release = sender.release(n_patients=500, privacy=Privacy(epsilon=1.0, cap=5.0))
-release.epsilon          # what the accountant charged, not what was asked for
+release = sender.release(n_patients=500, privacy=privacy)
+release.epsilon          # the centre's spend so far, produced by the accountant
 release.check().clean    # the embryo ledger, recomputed on the cohort
 release.verify().accepted
 
@@ -46,7 +48,7 @@ delivery.accepted, delivery.rejected, delivery.cohort
 
 | Object | What it is |
 |---|---|
-| `Centre` | One centre's fitted treatment process. `fit`, `rollout`, `release` |
+| `Centre` | One centre's fitted treatment process, fitted for plain or for private release. `fit`, `rollout`, `release` |
 | `Privacy` | What a release spends and the unit it protects: epsilon, delta, the contribution bound, the cumulative cap |
 | `Release` | A synthetic cohort, its certificate, and what it cost. `check`, `verify`, `as_payload` |
 | `Receiver` | Verifies, refuses, merges and replays. `receive` returns a `Delivery` |
@@ -60,15 +62,20 @@ python examples/quickstart.py
 ```
   Release(centre='Centre_1', 578 cycles, plain)
     ledger clean: True    verified: True
-  Release(centre='Centre_2', 400 cycles, epsilon=0.3222)
+  Release(centre='Centre_2', 512 cycles, epsilon=0.3222)
     asked for epsilon 1.0, accountant charged 0.3222
+    ledger clean: True    verified: True
   Release(centre='Centre_3', 559 cycles, plain)  <- one row edited in flight
     verified: False, refused on cohort_digest, ledger_invariants
 
   receiver accepted ['Centre_1', 'Centre_2']
   receiver rejected ['Centre_3'] on ['cohort_digest', 'ledger_invariants']
-  replayed 621 cycles, ledger clean: True
+  replayed 584 cycles, ledger clean: True
 ```
+
+The private release's noise is drawn from the operating system's cryptographic source on every
+run, so Centre_2's cycle count and the replayed count differ from run to run. The epsilon, the
+plain counts and the verdicts do not.
 
 ## What the guarantee is, and is not
 
@@ -78,8 +85,18 @@ row does not cover it.
 
 `Privacy(epsilon=...)` is a request. What lands on the certificate is what the accountant produced
 by composing the mechanism it actually ran, which is smaller. A release that would take the
-cumulative spend past `cap` raises `BudgetExhausted` before any noise is drawn: an exhausted budget
-is a refusal, not a quieter answer.
+cumulative spend past `cap` raises `BudgetExhausted` before any noise is drawn or any budget
+charged: an exhausted budget is a refusal, not a quieter answer.
+
+The noise is calibrated to a family contributing at most `max_cycles` cycles, so a centre that
+releases under privacy is fitted with it: `Centre.fit(fresh, fet, privacy=...)` keeps each
+family's first K cycles, and a private release from a fit without that bound is refused. A centre
+releases the way it was fitted. A plain release publishes the fitted process exactly, so a centre
+fitted for private release refuses a plain one.
+
+The release mode and the budget belong to one `Centre` object. A second `Centre` fitted on the
+same records starts a budget that knows nothing of the first, and a plain release from it publishes
+what the first protects. The library cannot see that, so it is the caller's to avoid.
 
 Three things this design does not give you, each stated because a reader could otherwise assume
 otherwise:
@@ -105,7 +122,7 @@ src/custody/
   certificate.py   what travels beside a payload, and how a receiver rechecks it
   exchange.py      nodes, payloads, the merge, and the receive path
   _dp.py           Renyi accountant and Gaussian calibration
-tests/             40 tests
+tests/             66 tests
 examples/          the quickstart above
 ```
 
