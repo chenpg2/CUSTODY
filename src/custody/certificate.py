@@ -8,8 +8,12 @@ sender's private data, so the certificate binds what CAN be checked locally:
    edited count is detectable.
 2. **Ledger invariants** — I1-I4 recomputed by the receiver on the payload
    itself (:func:`custody.check_ledger`), never trusted from the sender.
-3. **Privacy ledger arithmetic** — the declared per-role budgets sum to the
-   declared total; a payload claiming a total it did not spend is refused.
+3. **Privacy budget substantiation** — a certificate that states a spent budget
+   must carry the cap and delta behind it, and a spend within the cap, or it is
+   refused. The spend itself is not recomputed: the certificate does not carry
+   the mechanism's parameters, and no receiver could confirm the noise was drawn
+   at them. The declared role shares and the release count are recorded, and not
+   checked.
 4. **Kernel binding** — the kernels' hash matches the one the cohort claims,
    so a cohort cannot be swapped under a certificate that vouched for another.
 
@@ -160,8 +164,10 @@ def verify_certificate(
     """Check a certificate against the payload it came with.
 
     The digests, the counts and the ledger are recomputed on the payload. The
-    spent budget cannot be, since the receiver never sees the noise, and it is
-    refused unless the cap and delta that substantiate it are declared beside it.
+    spent budget is not: the certificate does not carry the mechanism's
+    parameters, and no receiver could confirm the noise was drawn at them. It is
+    refused unless the cap and delta that substantiate it are declared beside it
+    and the spend does not exceed the cap.
 
     Args:
         expected_unit: The receiver's own accounting-unit policy. When given, a

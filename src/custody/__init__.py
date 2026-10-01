@@ -2,7 +2,7 @@
 
 What crosses an institutional boundary is a fitted treatment-process model and
 the synthetic cohorts rolled out from it, each under a certificate the receiving
-centre recomputes for itself. The rollout engine carries the embryo bank in its
+centre checks for itself. The rollout engine carries the embryo bank in its
 state and subtracts before it spends, so a conservation violation is a value the
 engine cannot write rather than one it repairs afterwards.
 
@@ -21,7 +21,8 @@ Four objects carry the whole path::
 
 Everything the objects wrap is importable directly for anyone who wants the
 plumbing: :mod:`custody.cohort`, :mod:`custody.process`, :mod:`custody.privacy`,
-:mod:`custody.certificate` and :mod:`custody.exchange`.
+:mod:`custody.private_stats`, :mod:`custody.certificate` and
+:mod:`custody.exchange`.
 
 No mechanism here is new. The physiology cascade, contribution bounding, the
 Gaussian mechanism and Renyi composition are all cited work; the assembly and
@@ -30,6 +31,7 @@ the assisted-reproduction instance are ours.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,13 +51,18 @@ from .privacy import (
     BudgetExhausted,
     DPConfig,
     FamilyBudget,
+    PrivateFitError,
+    PrivateStatistics,
     _check_cycle_bound,
     cap_contributions,
-    privatise_kernels,
+    group_sensitivities,
+    private_statistics,
+    release_private_kernels,
+    zero_noise_kernels,
 )
 from .process import ProcessKernels, RolloutConfig, fit_kernels, rollout_cohort
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULT_PATIENTS = 500
 DEFAULT_SEED = 42
@@ -73,19 +80,30 @@ class Privacy:
     ``cap`` is the cumulative ceiling across releases from the same centre. A
     release that would cross it is refused rather than shrunk, which is the
     point: an exhausted budget is a refusal, not a quieter answer.
+
+    ``bank_column`` names the fresh-cycle column that records banked embryos,
+    by default the one :class:`custody.LedgerSchema` names. It is a public
+    constant of the centre rather than a choice made from the data, which a
+    private release must not depend on.
     """
 
     epsilon: float = 1.0
     delta: float | None = None
     max_cycles: int = 6
     cap: float | None = None
+    bank_column: str = "freeze_num"
 
     def __post_init__(self) -> None:
         _check_cycle_bound(self.max_cycles, "max_cycles")
+        if self.cap is not None and not (math.isfinite(self.cap) and self.cap > 0):
+            raise ValueError(f"cap must be a positive number; got {self.cap!r}")
 
     def _config(self) -> DPConfig:
         return DPConfig(
-            epsilon=self.epsilon, delta=self.delta, max_cycles_per_family=self.max_cycles
+            epsilon=self.epsilon,
+            delta=self.delta,
+            max_cycles_per_family=self.max_cycles,
+            bank_column=self.bank_column,
         )
 
 
@@ -152,10 +170,11 @@ class Release:
         """Verify the certificate the way a receiving centre would.
 
         The digests, the counts and the ledger are recomputed on what arrived,
-        and the privacy budget, which no receiver can recompute, is refused
-        unless its cap and delta substantiate it. A payload edited in flight
-        fails on the digest; one edited and re-certified still fails on the
-        invariants, which is the check that does not depend on the sender.
+        and a stated privacy budget is refused unless a cap and delta are
+        declared beside it and the spend does not exceed the cap. A payload
+        edited in flight fails on the digest; one edited and re-certified still
+        fails if the edit breaks a ledger invariant, which is the check that
+        does not depend on the sender, and passes if it breaks none.
         """
         return Verification._from(verify_certificate(self.cohort, self.kernels, self.certificate))
 
@@ -187,15 +206,22 @@ class Centre:
     records starts a budget that knows nothing of this one, which the library
     cannot see and the caller must not do.
 
-    A centre that releases under privacy carries its budget across releases. The
-    spend accumulates, and a release that would cross the cap is refused rather
-    than quietly weakened.
+    A centre that releases under privacy keeps the exact sums its releases are
+    derived from, and carries its budget across releases. The spend accumulates,
+    and a release that would cross the cap is refused rather than quietly
+    weakened.
     """
 
     def __init__(
-        self, kernels: ProcessKernels, *, name: str = "centre", n_families: int = 0
+        self,
+        kernels: ProcessKernels,
+        *,
+        name: str = "centre",
+        n_families: int = 0,
+        private: PrivateStatistics | None = None,
     ) -> None:
-        self._node = Node(node_id=name, kernels=kernels, n_families=n_families)
+        self._node = Node(node_id=name, kernels=kernels, private=private)
+        self._n_families = private.n_families if private is not None else n_families
 
     @classmethod
     def fit(
@@ -210,20 +236,28 @@ class Centre:
 
         Classical estimators only. ``fresh`` and ``fet`` need the columns
         :class:`custody.LedgerSchema` names, plus ``age_w``, ``AF``,
-        ``visit_date`` and ``live_birth``.
+        ``visit_date`` and ``live_birth``; a private fit also needs, in
+        ``fresh``, the column ``privacy.bank_column`` names.
 
-        Passing ``privacy`` fits on each family's first K cycles
-        (``privacy.max_cycles``) and makes this a centre that releases only
-        under privacy. The bound is what makes the sensitivity finite; it also
-        removes failures selectively, which the paper states and does not
-        correct for. Capping keeps every family, so the family count the budget
-        is priced against is the same either way.
+        Passing ``privacy`` makes this a centre that releases only under
+        privacy. It keeps the exact sums of seven groups of each family's first
+        K cycles (``privacy.max_cycles``), each value clipped to a public range,
+        and every release is derived from those sums with noise added. Its own
+        fit, on the same capped cycles, stays local: it serves :meth:`rollout`
+        and a receiver's own policy, and is never released. The bound is what
+        makes the sensitivity finite; it also removes failures selectively,
+        which the paper states and does not correct for. Capping keeps every
+        family, so the family count the budget is priced against is the same
+        either way.
         """
-        # Until 1.1.0 this counted the cycles capping dropped as the families,
-        # which priced delta and the sensitivities against the wrong number.
         n_families = int(pd.concat([fresh, fet])["pid"].nunique())
-        cap = privacy.max_cycles if privacy is not None else None
-        return cls(fit_kernels(fresh, fet, contribution_cap=cap), name=name, n_families=n_families)
+        if privacy is None:
+            return cls(fit_kernels(fresh, fet), name=name, n_families=n_families)
+        return cls(
+            fit_kernels(fresh, fet, contribution_cap=privacy.max_cycles),
+            name=name,
+            private=private_statistics(fresh, fet, privacy._config()),
+        )
 
     @property
     def kernels(self) -> ProcessKernels:
@@ -235,7 +269,7 @@ class Centre:
 
     @property
     def n_families(self) -> int:
-        return self._node.n_families
+        return self._n_families
 
     def rollout(
         self, n_patients: int = DEFAULT_PATIENTS, *, seed: int = DEFAULT_SEED, max_cycles: int = 6
@@ -261,8 +295,9 @@ class Centre:
 
         Without ``privacy`` the release is plain: the certificate still binds
         the cohort to the kernels, but no formal guarantee is claimed. With it,
-        the kernels are privatised under the family unit first, and the epsilon
-        on the certificate is what the accountant produced rather than what the
+        Gaussian noise is added to the centre's group sums under the family
+        unit, the kernels are derived from the noised sums, and the epsilon on
+        the certificate is what the accountant produced rather than what the
         operator declared. The noise comes from the operating system's
         cryptographic source and ``seed`` fixes only the simulation, so two
         private releases with the same seed differ, as a release made for
@@ -276,34 +311,43 @@ class Centre:
             BudgetExhausted: if the release would carry the cumulative spend
                 past the cap. Nothing is emitted, no noise is drawn and nothing
                 is charged.
+            PrivateFitError: if a regression cannot be fitted to the noised
+                sums. Nothing is emitted, and the release's charge stands,
+                because its noise was drawn.
             ValueError: if ``privacy`` does not match how the centre was
-                fitted, or asks for a bound tighter than the fit applied.
+                fitted, asks for a bound tighter than the fit applied, or names
+                another bank column.
         """
         if n_patients < 1:
             raise ValueError(f"a release needs at least one patient; {n_patients} was asked for")
-        cap = self.kernels.contribution_cap
-        if privacy is None and cap is not None:
-            # Until 1.1.0 this silently released under the previous release's
-            # privacy settings, and charged the budget for it.
+        stats = self._node.private
+        if privacy is None and stats is not None:
             raise ValueError(
-                f"{self.name} was fitted for private release, on at most {cap} cycles per "
-                f"family. A plain release would publish, exactly, the kernels its private "
-                f"releases protect; pass the privacy it releases under."
+                f"{self.name} was fitted for private release, on at most "
+                f"{stats.max_cycles_per_family} cycles per family. A plain release would "
+                f"publish, exactly, the fit its private releases protect; pass the privacy it "
+                f"releases under."
             )
-        if privacy is not None and cap is None:
+        if privacy is not None and stats is None:
             raise ValueError(
-                f"a private release needs kernels fitted on at most {privacy.max_cycles} "
-                f"cycles per family, and {self.name} was fitted without a contribution cap. "
-                f"A centre that releases privately is fitted with Centre.fit(fresh, fet, "
-                f"privacy=Privacy(...)); a plain release already made from the same records "
-                f"is not protected by it."
+                f"a private release is derived from the centre's group sums, and {self.name} "
+                f"was fitted without privacy, so it keeps none. A centre that releases "
+                f"privately is fitted with Centre.fit(fresh, fet, privacy=Privacy(...)); a "
+                f"plain release already made from the same records is not protected by it."
             )
-        if privacy is not None and cap is not None and cap > privacy.max_cycles:
-            raise ValueError(
-                f"{self.name} was fitted on at most {cap} cycles per family, and this release "
-                f"asks for at most {privacy.max_cycles}: the noise would be calibrated to fewer "
-                f"cycles than a family contributes. Release with max_cycles of at least {cap}."
-            )
+        if privacy is not None and stats is not None:
+            if stats.max_cycles_per_family > privacy.max_cycles:
+                raise ValueError(
+                    f"{self.name} was fitted on at most {stats.max_cycles_per_family} cycles "
+                    f"per family, and this release asks for at most {privacy.max_cycles}: the "
+                    f"noise would be calibrated to fewer cycles than a family contributes. "
+                    f"Release with max_cycles of at least {stats.max_cycles_per_family}."
+                )
+            if stats.bank_column != privacy.bank_column:
+                raise ValueError(
+                    f"{self.name} keeps sums banked on {stats.bank_column!r}, and this release "
+                    f"names {privacy.bank_column!r}"
+                )
         if privacy is None:
             payload = self._node.emit(n_patients=n_patients, seed=seed)
             return Release._from_payload(payload, epsilon=None, accounting={})
@@ -322,12 +366,13 @@ class Centre:
                 f"re-ceilinged part way through, and a new Centre fitted on the same records "
                 f"would start a budget that knows nothing of this one."
             )
-        # A refused release leaves the centre as it was: nothing was drawn, charged
-        # or published, so no cap is fixed and no settings change. A release that
-        # fails after it was priced also restores the settings, and a charge it
-        # made on a budget that already existed stays: the spend is overstated,
-        # never under.
+        # A release refused before its charge leaves the centre as it was: nothing
+        # was drawn, charged or published, so no cap is fixed and no settings
+        # change. A release that fails after its charge drew its noise, so the
+        # centre keeps the budget and the settings it was charged under: the
+        # spend is never understated.
         previous = (self._node.dp, self._node.budget)
+        releases_before = budget.releases if budget is not None else 0
         self._node.dp = config
         if budget is None:
             self._node.budget = FamilyBudget(
@@ -336,7 +381,9 @@ class Centre:
         try:
             payload = self._node.emit(n_patients=n_patients, seed=seed)
         except Exception:
-            self._node.dp, self._node.budget = previous
+            charged = self._node.budget is not None and self._node.budget.releases > releases_before
+            if not charged:
+                self._node.dp, self._node.budget = previous
             raise
         spent = None if self._node.budget is None else float(self._node.budget.spent)
         return Release._from_payload(payload, epsilon=spent, accounting=dict(self._node.dp_record))
@@ -436,6 +483,8 @@ __all__ = [
     "LedgerSchema",
     "Node",
     "Payload",
+    "PrivateFitError",
+    "PrivateStatistics",
     "ProcessKernels",
     "RolloutConfig",
     "cap_contributions",
@@ -443,11 +492,14 @@ __all__ = [
     "cohort_digest",
     "emit_payload",
     "fit_kernels",
+    "group_sensitivities",
     "issue_certificate",
     "kernel_digest",
     "merge_kernels",
-    "privatise_kernels",
+    "private_statistics",
     "receive",
+    "release_private_kernels",
     "rollout_cohort",
     "verify_certificate",
+    "zero_noise_kernels",
 ]

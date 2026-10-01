@@ -18,14 +18,18 @@ from custody import (
     Centre,
     Delivery,
     Privacy,
+    PrivateFitError,
     Receiver,
     Release,
     Verification,
 )
 
 # What the private tests release under. A centre releases the way it was fitted,
-# so the ones that release privately are fitted with it too.
-PRIVACY = Privacy(epsilon=1.0, cap=5.0)
+# so the ones that release privately are fitted with it too. Three hundred
+# families are far too few for a useful release at a realistic budget, where the
+# noise would swamp the sums and the fit would fail, so these tests release at a
+# large epsilon; the mechanism is the same.
+PRIVACY = Privacy(epsilon=1e5, cap=5e5)
 
 
 class TestCentre:
@@ -78,10 +82,11 @@ class TestPrivacy:
         centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
         release = centre.release(200, seed=5, privacy=PRIVACY)
         assert release.private
-        # The accountant's number, which is not the epsilon that was asked for.
+        # The accountant's number, which is not the epsilon that was asked for:
+        # composing the release's mechanisms costs less than the sum of their shares.
         assert release.epsilon is not None
-        assert release.epsilon != pytest.approx(1.0)
-        assert 0.0 < release.epsilon < 1.0
+        assert release.epsilon != pytest.approx(PRIVACY.epsilon)
+        assert 0.0 < release.epsilon < PRIVACY.epsilon
 
     def test_spend_accumulates_across_releases(self, cohort):
         centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
@@ -101,6 +106,21 @@ class TestPrivacy:
         release = centre.release(200, seed=5, privacy=PRIVACY)
         assert release.check().clean and release.verify().accepted
 
+    def test_a_private_cohort_carries_no_copied_covariates(self, cohort):
+        """Its ages and follicle counts are grid centres, not the centre's own records."""
+        fresh, _fet = cohort
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        released = centre.release(200, seed=5, privacy=PRIVACY).cohort
+        assert set(released["age_w"].unique()) <= {19.0 + 2 * i for i in range(19)}
+        assert set(released["AF"].unique()) <= {2.0 + 4 * j for j in range(15)}
+        assert not set(released["age_w"]) & set(fresh["age_w"])
+
+    def test_a_cap_must_be_a_positive_number(self):
+        """A cap of NaN compared false against every spend, so nothing was ever refused."""
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="positive number"):
+                Privacy(cap=bad)
+
     def test_contribution_bounding_keeps_every_family(self, cohort):
         """Until 1.1.0 the fit counted the cycles capping dropped as the families."""
         fresh, fet = cohort
@@ -114,7 +134,7 @@ class TestReleaseMode:
 
     def test_a_plain_fit_cannot_release_privately(self, cohort):
         centre = Centre.fit(*cohort, name="Centre_1")
-        with pytest.raises(ValueError, match="without a contribution cap"):
+        with pytest.raises(ValueError, match="fitted without privacy"):
             centre.release(200, seed=5, privacy=PRIVACY)
         assert centre.spent == 0.0
         assert not centre.release(200, seed=5).private
@@ -154,6 +174,33 @@ class TestReleaseMode:
             centre.release(200, seed=6, privacy=Privacy(epsilon=9.0, cap=0.001))
         assert centre.as_node().dp == PRIVACY._config()
         assert centre.spent == pytest.approx(first.epsilon)
+
+    def test_another_bank_column_is_refused_before_it_is_priced(self, cohort):
+        """The banking column is a public constant of the centre, fixed when it was fitted."""
+        centre = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        other = Privacy(epsilon=PRIVACY.epsilon, cap=PRIVACY.cap, bank_column="total_freeze_num")
+        with pytest.raises(ValueError, match="banked on"):
+            centre.release(200, seed=5, privacy=other)
+        assert centre.spent == 0.0 and centre.as_node().budget is None
+
+    def test_a_release_that_fails_to_fit_keeps_its_charge(self, cohort):
+        """The noise was drawn, so forgetting the charge would understate the spend."""
+        from dataclasses import replace
+
+        import numpy as np
+
+        fitted = Centre.fit(*cohort, name="Centre_1", privacy=PRIVACY)
+        stats = fitted.as_node().private
+        assert stats is not None
+        sums = dict(stats.sums)
+        sums["G5_cells"] = np.concatenate([np.full(9, -1e9), sums["G5_cells"][9:]])
+        centre = Centre(fitted.kernels, name="Centre_1", private=replace(stats, sums=sums))
+        with pytest.raises(PrivateFitError):
+            centre.release(200, seed=5, privacy=PRIVACY)
+        budget = centre.as_node().budget
+        assert budget is not None and budget.releases == 1
+        assert centre.spent > 0.0
+        assert centre.as_node().dp == PRIVACY._config()
 
 
 class TestReceiver:

@@ -1,65 +1,64 @@
-"""The DP layer the exchange was missing — ε that is produced, not declared.
+"""The privacy layer: an epsilon the accountant produces, not one the sender declares.
 
-The V3/V4 pre-compute audit (2026-08-28) found that kernels crossed the
-institutional boundary as plain maximum-likelihood fits while the certificate
-carried a hardcoded ``epsilon`` literal. That is a decorative guarantee, and
-a paper claiming it would be claiming a mechanism the pipeline did not have.
+**What is released.** A private node keeps the exact sums of seven groups of its
+capped, clipped cycles (:mod:`custody.private_stats`). Each release adds
+Gaussian noise to them, calibrated with :func:`custody._dp.calibrate_sigma` to a
+sensitivity that follows from public bounds, and derives every kernel field from
+the noised sums alone. :class:`custody._dp.RDPAccountant` composes the
+mechanisms, and the spent budget is what the certificate reports.
 
-This module supplies the mechanism. Each released kernel parameter is a
-bounded-sensitivity statistic; Gaussian noise is calibrated to the family-unit
-budget with :func:`custody._dp.calibrate_sigma`, composition is tracked by
-:class:`custody._dp.RDPAccountant`, and the spent budget is what the
-certificate reports.
+Releases 1.0.0 and 1.1.0 added Gaussian noise to kernels fitted by maximum
+likelihood, with sensitivities that did not hold for what they released, so the
+budget they certified understated the loss. This layer replaces that one.
 
 **Accounting unit.** The unit is the FAMILY (one patient's whole trajectory,
 and with it her partner's and any offspring's records), because that is the
-unit the data actually has — the role-separated alternative was analysed and
-shown unattainable (`plan/art_role_separation_theorem.md`). A family
-contributes at most ``max_cycles_per_family`` cycles; contributions beyond the
-cap are dropped, which is what makes sensitivity finite (Amin et al., ICML
-2019, cited not claimed).
+unit the data actually has. A family contributes at most
+``max_cycles_per_family`` cycles, its first in visit order (Amin et al., ICML
+2019, cited not claimed). The guarantee is bounded DP: the number of families is
+invariant under replacing one, and it is disclosed.
 
-**What is NOT claimed.** Nothing here is a new mechanism. Gaussian output
-perturbation, RDP composition, and contribution capping are textbook; the
+**What is NOT claimed.** Nothing here is a new mechanism. Gaussian noise on
+bounded sums, RDP composition and contribution capping are textbook; the
 engineering claim is that the exchange applies them, accounts for them across
-releases, and lets a receiver check the arithmetic.
+releases, and lets a receiver check that a stated budget is substantiated.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ._dp import RDPAccountant, calibrate_sigma, default_delta
+from .private_stats import (
+    GROUPS,
+    HISTOGRAM_GROUP,
+    KERNEL_GROUPS,
+    OOCYTE_MAX,
+    POOL_SIZE,
+    PrivateFitError,
+    PrivateStatistics,
+    group_sums,
+    kernels_from_sums,
+)
 from .process import ProcessKernels
 
 __all__ = [
     "BudgetExhausted",
     "DPConfig",
     "FamilyBudget",
-    "privatise_kernels",
+    "PrivateFitError",
+    "PrivateStatistics",
+    "cap_contributions",
+    "group_sensitivities",
+    "private_statistics",
+    "release_private_kernels",
+    "zero_noise_kernels",
 ]
-
-# Released rates are means of per-family bounded quantities. Capping each
-# family at K cycles bounds one family's influence on a rate by K/n, and on a
-# log-scale coefficient by the range the fitter is allowed to move.
-RATE_FIELDS = (
-    "fert_rate",
-    "dev_rate",
-    "p_bank_given_surplus",
-    "p_continue_fail_nobank",
-    "p_continue_fail_bank",
-    "p_continue_birth_nobank",
-    "p_continue_birth_bank",
-    "p_use_bank",
-    "p_fresh_transfer",
-    "fet_live_birth_rate",
-)
-VECTOR_FIELDS = ("yield_beta", "transfer_beta")
-SCALAR_FIELDS = ("yield_alpha", "fet_transfer_mean")
 
 
 class BudgetExhausted(RuntimeError):
@@ -78,17 +77,26 @@ def _check_cycle_bound(k: object, name: str) -> None:
 
 @dataclass(frozen=True)
 class DPConfig:
-    """Per-release privacy parameters."""
+    """Per-release privacy parameters.
+
+    ``bank_column`` names the column that records banked embryos. It is a public
+    per-centre constant: choosing it from how often each column is filled, as the
+    plain fitter does, would make it a function of the data. The default is the
+    banked column :class:`custody.LedgerSchema` names.
+    """
 
     epsilon: float = 1.0
     delta: float | None = None
     max_cycles_per_family: int = 6
-    coefficient_range: float = 4.0  # bound on a released coefficient's span
-    scalar_range: float = 10.0
     covariate_budget_share: float = 0.25  # share of epsilon spent on the covariate histogram
+    bank_column: str = "freeze_num"
 
     def __post_init__(self) -> None:
         _check_cycle_bound(self.max_cycles_per_family, "max_cycles_per_family")
+        if not self.epsilon > 0:
+            raise ValueError(f"epsilon must be positive; got {self.epsilon!r}")
+        if not 0.0 < self.covariate_budget_share < 1.0:
+            raise ValueError("covariate_budget_share must lie strictly between 0 and 1")
 
     def resolved_delta(self, n_families: int) -> float:
         return self.delta if self.delta is not None else default_delta(max(n_families, 2))
@@ -98,8 +106,8 @@ class DPConfig:
 class FamilyBudget:
     """Cumulative family-unit spend for one node, across every release it makes.
 
-    The audit's F4a: a node could previously emit ten payloads at ε=1 and no
-    object in the system ever said ε=10. This is that object.
+    Without it a node could emit ten payloads at epsilon 1 and no object in the
+    system would say epsilon 10. This is that object.
     """
 
     cap_epsilon: float
@@ -108,6 +116,9 @@ class FamilyBudget:
     releases: int = 0
 
     def __post_init__(self) -> None:
+        # A cap of NaN compared false against every spend, so nothing was ever refused.
+        if not (math.isfinite(self.cap_epsilon) and self.cap_epsilon > 0):
+            raise ValueError(f"cap_epsilon must be a positive number; got {self.cap_epsilon!r}")
         if self.accountant is None:
             self.accountant = RDPAccountant()
 
@@ -131,10 +142,10 @@ class FamilyBudget:
     ) -> None:
         """Charge a composition step, or refuse it whole.
 
-        :func:`privatise_kernels` charges each release once, with every mechanism
-        it will run, so a refusal leaves the budget untouched. ``new_release``
-        counts payloads rather than charges, for a caller composing a payload
-        from more than one charge.
+        A release is charged once, with every mechanism it will run, before any
+        noise is drawn, so a refusal leaves the budget untouched. ``new_release``
+        counts releases rather than charges; a release whose fit fails after its
+        charge still counts, because its noise was drawn.
         """
         if self.would_exceed(sensitivities, sigmas):
             raise BudgetExhausted(
@@ -166,8 +177,7 @@ def cap_contributions(
     every row: without one, "first" has no meaning and is refused rather than
     guessed from the order the rows happen to be stored in. Rows are selected
     from the frames as given, so a family within the cap is fitted on exactly
-    the rows it had, with its columns and types untouched; the first version
-    concatenated the two frames, which gave each one the other's columns.
+    the rows it had, with its columns and types untouched.
 
     Returns:
         The capped fresh and frozen-transfer frames, and the number of cycles
@@ -209,129 +219,132 @@ def cap_contributions(
     return fresh.iloc[fresh_rows], fet.iloc[fet_rows], int((~keep).sum())
 
 
-def _sensitivities(n_families: int, config: DPConfig) -> dict[str, float]:
-    """Replace-one-family L2 sensitivities of the released fields.
+def group_sensitivities(k: int) -> dict[str, float]:
+    """Replace-one-family L2 sensitivity of each group's sum.
 
-    A rate is a mean over at most ``K`` cycles of one family out of ``n``
-    families, so replacing a family moves it by at most ``K/n`` — the
-    contribution-capping bound. Coefficients and scalars are bounded by their
-    declared release range over the same denominator.
+    One family's contribution to a group is a non-negative vector c with
+    ``‖c‖₂ ≤ C`` and coordinates ``c_j ≤ b_j``; replacing it moves the sum by at
+    most ``min(√2·C, ‖b‖₂)``, since ``‖c′ − c‖² ≤ ‖c‖² + ‖c′‖²`` when
+    ``⟨c, c′⟩ ≥ 0`` and ``|c′_j − c_j| ≤ b_j``.
     """
-    k, n = config.max_cycles_per_family, max(n_families, 1)
-    rate = k / n
-    coeff = config.coefficient_range * k / n
-    scalar = config.scalar_range * k / n
-    out = {f: rate for f in RATE_FIELDS}
-    out.update({f: coeff for f in VECTOR_FIELDS})
-    out.update({f: scalar for f in SCALAR_FIELDS})
-    return out
+    _check_cycle_bound(k, "k")
+    e = OOCYTE_MAX
+    return {
+        "G1": k * e * math.sqrt(3.0),  # (ΣE, ΣF, ΣZ), each at most k·40
+        "G2": 2.0 * k,  # four counts, each at most k
+        "G3": k * math.sqrt(12.0),  # (count, clipped transfers ≤ 3k, count, count)
+        # Cell totals sum to at most k; continued, chances and used are each at
+        # most k − 1, since the last cycle does not continue and the first has
+        # no bank.
+        "G4": math.sqrt(2.0 * (k**2 + 3 * (k - 1) ** 2)),
+        "G5_cells": 2.0 * e * k,  # √2 · √((40k)² + (40k)²), counts scaled by 40
+        "G5_sq": k * e**2,  # ΣE² over at most k cycles of at most 40 oocytes
+        "G6": 2.0 * k,  # √2 · √(k² + k²)
+        "G7": math.sqrt(2.0),  # one baseline row per family
+    }
 
 
-def privatise_kernels(
-    kernels: ProcessKernels,
+def private_statistics(
+    fresh: pd.DataFrame, fet: pd.DataFrame, config: DPConfig
+) -> PrivateStatistics:
+    """What a private node keeps: the exact group sums of its capped cycles."""
+    if config.bank_column not in fresh.columns:
+        raise ValueError(f"the banking column {config.bank_column!r} is not in the fresh cycles")
+    capped_fresh, capped_fet, _dropped = cap_contributions(fresh, fet, config.max_cycles_per_family)
+    families = pd.concat([capped_fresh["pid"], capped_fet["pid"]]).nunique()
+    return PrivateStatistics(
+        n_families=int(families),
+        max_cycles_per_family=config.max_cycles_per_family,
+        bank_column=config.bank_column,
+        sums=group_sums(capped_fresh, capped_fet, config.bank_column),
+    )
+
+
+def _sigmas(config: DPConfig, delta: float, sens: dict[str, float]) -> dict[str, float]:
+    """Each kernel mechanism at an equal share of three quarters; the histogram at a quarter."""
+    share = config.epsilon * (1.0 - config.covariate_budget_share) / len(KERNEL_GROUPS)
+    sigmas = {
+        g: calibrate_sigma(epsilon=share, delta=delta, sensitivity=sens[g]) for g in KERNEL_GROUPS
+    }
+    sigmas[HISTOGRAM_GROUP] = calibrate_sigma(
+        epsilon=config.epsilon * config.covariate_budget_share,
+        delta=delta,
+        sensitivity=sens[HISTOGRAM_GROUP],
+    )
+    return sigmas
+
+
+def _check_compatible(stats: PrivateStatistics, config: DPConfig) -> None:
+    if stats.max_cycles_per_family > config.max_cycles_per_family:
+        raise ValueError(
+            f"statistics capped at {stats.max_cycles_per_family} cycles per family; the noise "
+            f"would be calibrated to {config.max_cycles_per_family}"
+        )
+    if stats.bank_column != config.bank_column:
+        raise ValueError(
+            f"statistics banked on {stats.bank_column!r}, the release on {config.bank_column!r}"
+        )
+
+
+def release_private_kernels(
+    stats: PrivateStatistics,
     *,
-    n_families: int,
     config: DPConfig,
     budget: FamilyBudget,
     rng: np.random.Generator,
 ) -> tuple[ProcessKernels, dict[str, object]]:
-    """Return DP kernels and the accounting record the certificate will carry.
+    """Noise the group sums once, charge the budget, and derive the kernels.
 
     Raises:
-        BudgetExhausted: if this release would take the node past its cap. The
-            node must then refuse to emit rather than release anyway. Nothing
+        BudgetExhausted: if the release would take the node past its cap. Nothing
             is drawn and nothing is charged.
-        ValueError: if the kernels were not fitted on contribution-capped data,
-            or were capped above ``config.max_cycles_per_family``.
+        PrivateFitError: if a regression cannot be fitted to the noised sums. The
+            release fails and its spend stands, because the noise was drawn.
+        ValueError: if the statistics were computed under a different cap or
+            banking column, or the budget's delta is not the one calibrated to.
     """
-    # The sensitivities below assume a family contributes at most K cycles, and
-    # until 1.1.0 nothing enforced it. The fit records its cap; refuse without one.
-    cap = kernels.contribution_cap
-    if cap is None or cap > config.max_cycles_per_family:
-        raise ValueError(
-            f"kernels fitted with contribution cap {cap}; the noise is calibrated to at most "
-            f"{config.max_cycles_per_family} cycles per family. Fit them with "
-            f"fit_kernels(..., contribution_cap={config.max_cycles_per_family})."
-        )
-    delta = config.resolved_delta(n_families)
-    sens = _sensitivities(n_families, config)
-    # The per-release budget covers the kernel fields AND the covariate
-    # histogram; splitting it here is what makes the declared epsilon the
-    # epsilon actually spent.
-    kernel_epsilon = config.epsilon * (1.0 - config.covariate_budget_share)
-    sigmas = {
-        key: calibrate_sigma(epsilon=kernel_epsilon / len(sens), delta=delta, sensitivity=s)
-        for key, s in sens.items()
+    _check_compatible(stats, config)
+    delta = config.resolved_delta(stats.n_families)
+    if not math.isclose(budget.delta, delta, rel_tol=1e-12):
+        raise ValueError(f"budget delta {budget.delta} is not the calibrated delta {delta}")
+    sens = group_sensitivities(config.max_cycles_per_family)
+    sigmas = _sigmas(config, delta, sens)
+    budget.charge(sens, sigmas)  # the whole release, before any draw
+    noised = {
+        g: stats.sums[g] + rng.normal(0.0, sigmas[g], size=stats.sums[g].shape) for g in GROUPS
     }
-    hist_sensitivity, hist_sigma = _histogram_calibration(n_families, config)
-    # One charge for the whole release, before any noise is drawn. The histogram
-    # used to be charged after the kernel noise was drawn, so a release refused
-    # there had already drawn and paid for its kernel noise. The mechanisms enter
-    # the accountant in the same order as before, so every release that is not
-    # refused spends exactly what it spent then.
-    budget.charge(
-        {**sens, "covariate_histogram": hist_sensitivity},
-        {**sigmas, "covariate_histogram": hist_sigma},
+    kernels = kernels_from_sums(
+        noised,
+        histogram_threshold=2.0 * sigmas[HISTOGRAM_GROUP],
+        rng=rng,
+        contribution_cap=config.max_cycles_per_family,
     )
-
-    updates: dict[str, Any] = {}
-    for field in RATE_FIELDS:
-        value = float(getattr(kernels, field)) + rng.normal(0.0, sigmas[field])
-        updates[field] = float(np.clip(value, 1e-4, 1 - 1e-4))
-    for field in SCALAR_FIELDS:
-        value = float(getattr(kernels, field)) + rng.normal(0.0, sigmas[field])
-        updates[field] = float(max(value, 1e-3))
-    for field in VECTOR_FIELDS:
-        vector = np.asarray(getattr(kernels, field), dtype=float)
-        updates[field] = vector + rng.normal(0.0, sigmas[field], size=vector.shape)
-
-    # The empirical covariate pool is verbatim real data and must never cross a
-    # boundary: replace it with a DP histogram resample over a coarse grid.
-    updates["covariate_pool"] = _private_covariate_pool(
-        kernels.covariate_pool, sigma=hist_sigma, rng=rng
-    )
-    record = {
+    record: dict[str, Any] = {
         "accounting": budget.as_dict(),
         "epsilon_this_release": float(config.epsilon),
         "delta": float(delta),
         "max_cycles_per_family": int(config.max_cycles_per_family),
-        "n_families": int(n_families),
-        "sigma_by_field": {k: float(v) for k, v in sigmas.items()},
-        "mechanism": "gaussian output perturbation, RDP composition (custody._dp)",
+        "n_families": int(stats.n_families),
+        "bank_column": config.bank_column,
+        "sensitivity_by_group": {g: float(v) for g, v in sens.items()},
+        "sigma_by_group": {g: float(v) for g, v in sigmas.items()},
+        "pool_size": POOL_SIZE,
+        "mechanism": "Gaussian noise on clipped group sums, RDP composition",
     }
-    return replace(kernels, **updates), record
+    return kernels, record
 
 
-def _histogram_calibration(n_families: int, config: DPConfig) -> tuple[float, float]:
-    """Sensitivity and noise scale of the covariate histogram's share."""
-    sensitivity = float(config.max_cycles_per_family)  # one family touches <= K cells
-    sigma = calibrate_sigma(
-        epsilon=config.epsilon * config.covariate_budget_share,
-        delta=config.resolved_delta(n_families),
-        sensitivity=sensitivity,
-    )
-    return sensitivity, sigma
+def zero_noise_kernels(stats: PrivateStatistics, config: DPConfig) -> ProcessKernels:
+    """The private estimator with no noise. Never released; a reference.
 
-
-def _private_covariate_pool(
-    pool: np.ndarray,
-    *,
-    sigma: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Release covariates as a noised histogram, never as copied rows.
-
-    The audit (F9) identified the empirical pool as the release's only verbatim
-    channel. A DP histogram over integer (age, AFC) cells removes it: cell
-    counts get Gaussian noise at family-unit sensitivity, and the pool is
-    resampled from the noised distribution. The caller has already charged the
-    budget for it.
+    It separates what the private estimator changes (clipping, grids, a pool of
+    patients) from what the noise changes. Its pool is drawn with a fixed,
+    data-independent seed.
     """
-    grid = np.rint(pool).astype(int)
-    cells, counts = np.unique(grid, axis=0, return_counts=True)
-    noised = np.maximum(counts + rng.normal(0.0, sigma, size=counts.shape), 0.0)
-    if noised.sum() <= 0:
-        noised = np.ones_like(noised)
-    probabilities = noised / noised.sum()
-    draw = rng.choice(len(cells), size=len(pool), p=probabilities)
-    return cells[draw].astype(float)
+    _check_compatible(stats, config)
+    return kernels_from_sums(
+        stats.sums,
+        histogram_threshold=0.0,
+        rng=np.random.default_rng(0),
+        contribution_cap=config.max_cycles_per_family,
+    )

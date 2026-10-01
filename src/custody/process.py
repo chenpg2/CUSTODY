@@ -89,8 +89,8 @@ class ProcessKernels:
     fet_live_birth_rate: float  # FET transfers have their own outcome rate
     p_fresh_transfer: float  # else freeze-all: the whole cohort goes to the bank
     # The contribution cap the fit applied, or None for a fit on every cycle.
-    # Not a released parameter, so it is not in as_dict and not in the digest;
-    # privatise_kernels reads it and refuses kernels fitted without one.
+    # Not a released parameter, so it is not in as_dict and not in the digest.
+    # Private kernels are derived from capped group sums and carry the cap too.
     contribution_cap: int | None = None
 
     def as_dict(self) -> dict[str, object]:

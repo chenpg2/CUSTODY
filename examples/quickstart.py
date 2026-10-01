@@ -79,13 +79,17 @@ def fabricate(n_patients: int = 400, seed: int = 0) -> tuple[pd.DataFrame, pd.Da
 
 
 def main() -> int:
-    fresh, fet = fabricate()
+    # A private release needs a cohort of realistic size. On a few hundred families
+    # the noise swamps the sums, and the release fails with PrivateFitError rather
+    # than falling back to a plain fit.
+    fresh, fet = fabricate(n_patients=20_000)
     print(f"input cohort: {len(fresh)} fresh cycles, {len(fet)} frozen transfers\n")
 
     # Three centres fit their own process. The records never leave. Centre_2
-    # will release under privacy, so it fits on each family's first six cycles:
-    # the noise is calibrated to that bound, and a private release from a fit
-    # without it is refused.
+    # will release under privacy, so it keeps the exact sums of each family's
+    # first six cycles, clipped to public ranges, and derives every release from
+    # them with noise added. A centre fitted without privacy keeps no such sums,
+    # and a private release from it is refused.
     privacy = Privacy(epsilon=1.0, cap=5.0)
     senders = [
         Centre.fit(fresh, fet, name="Centre_1"),

@@ -18,7 +18,9 @@ do with it that it could not do alone. Three moving parts:
     The receiver's protocol: verify each payload, DISCARD the ones that fail,
     merge what survives, and replay under the receiver's OWN policy. The last
     step is the point — a receiving clinic does not inherit another centre's
-    transfer culture, it applies its own to better-informed physiology.
+    transfer culture, it applies its own to physiology fitted elsewhere. Whether
+    that physiology serves it better than its own is an empirical question, which
+    the paper's transport experiments answered in the negative on their cohort.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ import numpy as np
 import pandas as pd
 
 from .certificate import Certificate, issue_certificate, verify_certificate
-from .privacy import DPConfig, FamilyBudget, privatise_kernels
+from .privacy import DPConfig, FamilyBudget, PrivateStatistics, release_private_kernels
 from .process import ProcessKernels, RolloutConfig, rollout_cohort
 
 __all__ = ["ExchangeResult", "Node", "Payload", "emit_payload", "merge_kernels", "receive"]
@@ -60,10 +62,11 @@ class Payload:
 class Node:
     """A participating centre.
 
-    When ``dp`` is set the node privatises its kernels before release and the
-    certificate reports the budget the accountant PRODUCED. Without it the node
-    releases plain fits, which is honest only for engineering tests that make
-    no privacy claim — ``dp=None`` must never accompany a privacy sentence.
+    When ``dp`` is set the node releases kernels derived from noised group sums
+    (``private``, its exact sums, which never leave it) and the certificate
+    reports the budget the accountant PRODUCED. Without it the node releases its
+    plain fit, which is honest only for engineering tests that make no privacy
+    claim — ``dp=None`` must never accompany a privacy sentence.
     """
 
     node_id: str
@@ -74,7 +77,7 @@ class Node:
     corrupt: bool = False
     dp: DPConfig | None = None
     budget: FamilyBudget | None = None
-    n_families: int = 0
+    private: PrivateStatistics | None = None
     dp_record: dict[str, Any] = field(default_factory=dict)
 
     def emit(self, *, n_patients: int, seed: int, noise_seed: int | None = None) -> Payload:
@@ -101,35 +104,49 @@ def emit_payload(
     Raises:
         BudgetExhausted: when the node's cumulative family-unit spend would
             pass its declared cap. A node out of budget refuses to release.
+        PrivateFitError: when a regression cannot be fitted to the noised sums.
+            The release fails, and its charge stays on the node's budget,
+            because its noise was drawn.
         ValueError: when a node without privacy settings holds kernels fitted
-            for private release, or a node with them holds kernels fitted
-            without a contribution cap at or below its bound.
+            for private release, or a node with them holds no private
+            statistics, or statistics computed under another cap or bank column.
     """
     kernels = node.kernels
-    if node.dp is None and kernels.contribution_cap is not None:
-        # A capped fit is one made for private release, and a plain payload would
-        # publish it exactly: what the private releases protect.
+    if node.dp is None and (kernels.contribution_cap is not None or node.private is not None):
+        # A node set up for private release must not publish its plain fit, which a
+        # plain payload would carry exactly: what the private releases protect.
         raise ValueError(
-            f"{node.node_id}'s kernels were fitted for private release, on at most "
-            f"{kernels.contribution_cap} cycles per family; a plain payload would publish "
-            f"them exactly. Give the node its privacy settings to release them."
+            f"{node.node_id} was set up for private release; a plain payload would publish "
+            f"its fit exactly. Give the node its privacy settings to release."
         )
     epsilon_total, epsilon_cap, delta, releases = None, None, None, 1
     if node.dp is not None:
+        if node.private is None:
+            raise ValueError(
+                f"{node.node_id} has privacy settings but no private statistics; compute "
+                f"them with private_statistics(fresh, fet, config)"
+            )
+        had_budget = node.budget is not None
         budget = node.budget or FamilyBudget(
             cap_epsilon=node.dp.epsilon,
-            delta=node.dp.resolved_delta(node.n_families),
+            delta=node.dp.resolved_delta(node.private.n_families),
         )
-        kernels, record = privatise_kernels(
-            node.kernels,
-            n_families=node.n_families,
-            config=node.dp,
-            budget=budget,
-            rng=np.random.default_rng(
-                noise_seed if noise_seed is not None else secrets.randbits(128)
-            ),
-        )
-        node.budget = budget  # only once the release is priced: a refusal leaves none
+        # On the node before the release: a release that is charged and then fails
+        # to fit must keep its charge on the node's books.
+        node.budget = budget
+        try:
+            kernels, record = release_private_kernels(
+                node.private,
+                config=node.dp,
+                budget=budget,
+                rng=np.random.default_rng(
+                    noise_seed if noise_seed is not None else secrets.randbits(128)
+                ),
+            )
+        except Exception:
+            if not had_budget and budget.releases == 0:
+                node.budget = None  # refused before any charge: a refusal leaves no budget
+            raise
         node.dp_record = record
         epsilon_total, epsilon_cap = budget.spent, budget.cap_epsilon
         delta, releases = budget.delta, budget.releases
@@ -155,10 +172,10 @@ def emit_payload(
 def merge_kernels(kernels: list[ProcessKernels]) -> ProcessKernels:
     """Combine verified kernels: precision-free mean of parameters, pooled covariates.
 
-    Deliberately the simplest defensible merge. E-A/E-A2 measured what
-    heterogeneity-aware pooling buys on this cohort (little, and negatively
-    above small n), so the system does not claim a clever aggregator — it
-    claims a verifiable exchange.
+    Deliberately the simplest defensible merge. The paper's transport experiments
+    measured what heterogeneity-aware pooling buys on their cohort (little, and
+    negatively above small n), so the system does not claim a clever aggregator —
+    it claims a verifiable exchange.
     """
     if not kernels:
         raise ValueError("no verified kernels to merge")
