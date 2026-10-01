@@ -175,9 +175,9 @@ statement says how editors and reviewers can obtain them.
 @unpublished{chen2026custody,
   title  = {CUSTODY: a privacy-preserving exchange releasing verifiable synthetic
             cohorts that conserve the embryo ledger in multi-cycle assisted reproduction},
-  author = {Chen, Peigen and Pan, Xinyi and Shi, Juanzi and Jin, Lei and Mao, Yundong and
-            Zhang, Cuilian and Fang, Cong and Li, Tingting},
-  note   = {Manuscript. Peigen Chen and Xinyi Pan contributed equally.},
+  author = {Chen, Peigen and Pan, Xinyi and Zhao, Xin and Shi, Juanzi and Jin, Lei and
+            Mao, Yundong and Zhang, Cuilian and Yang, Xing and Fang, Cong and Li, Tingting},
+  note   = {Manuscript. Peigen Chen, Xinyi Pan and Xin Zhao contributed equally.},
   year   = {2026}
 }
 ```
